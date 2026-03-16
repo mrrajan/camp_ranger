@@ -73,8 +73,17 @@ async fn main() {
             Arg::new("cpe")
                 .short('c')
                 .long("cpe")
-                .help("CPE to filter SBOMs")
-                .required(false),
+                .help("CPE to filter SBOMs (retrieves descendants)")
+                .required(false)
+                .conflicts_with("purl"),
+        )
+        .arg(
+            Arg::new("purl")
+                .short('p')
+                .long("purl")
+                .help("PURL to filter SBOMs (retrieves ancestors)")
+                .required(false)
+                .conflicts_with("cpe"),
         )
         .arg(
             Arg::new("compare")
@@ -89,6 +98,7 @@ async fn main() {
                     "tpa_api_client_secret",
                     "sbom_dir",
                     "cpe",
+                    "purl",
                 ]),
         )
         .get_matches();
@@ -223,6 +233,84 @@ async fn main() {
                             match std::fs::write(output_file, json_string) {
                                 Ok(_) => {
                                     log::info!("\n✅ Hierarchical JSON output written to: {}", output_file);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to write JSON file: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to serialize JSON: {}", e);
+                        }
+                    }
+                }
+            } else if let Some(purl) = matches.get_one::<String>("purl") {
+                let hierarchies = corr.get_sbom_ancestors_by_purl(purl);
+                if hierarchies.is_empty() {
+                    log::error!("PURL not found in any SBOM");
+                } else {
+                    log::info!("================================================");
+                    log::info!("Found {} ancestor tree(s) for PURL: {}", hierarchies.len(), purl);
+                    log::info!("================================================\n");
+
+                    // Display each ancestor tree separately
+                    for (idx, hierarchy) in hierarchies.iter().enumerate() {
+                        let starting_node = &hierarchy[0];
+                        let starting_name = starting_node
+                            .sbom
+                            .metadata
+                            .component
+                            .as_ref()
+                            .and_then(|c| c.name.as_ref())
+                            .map(|s| s.as_str())
+                            .unwrap_or("Unknown");
+
+                        log::info!("╔════════════════════════════════════════════════");
+                        log::info!("║ Ancestor Tree #{}: {} ({})", idx + 1, starting_name, starting_node.sbom.serial_number);
+                        log::info!("║ Total SBOMs in tree: {}", hierarchy.len());
+                        log::info!("╚════════════════════════════════════════════════\n");
+
+                        // Group by rank within this hierarchy (ascending order for ancestors)
+                        let min_rank = hierarchy.iter().map(|n| n.rank).min().unwrap_or(0);
+                        let max_rank = hierarchy.iter().map(|n| n.rank).max().unwrap_or(0);
+                        for rank in min_rank..=max_rank {
+                            let nodes_at_rank: Vec<_> = hierarchy.iter().filter(|n| n.rank == rank).collect();
+                            if !nodes_at_rank.is_empty() {
+                                log::info!("  📊 Rank {} ({} SBOM(s)):", rank, nodes_at_rank.len());
+                                for node in nodes_at_rank {
+                                    let name = node
+                                        .sbom
+                                        .metadata
+                                        .component
+                                        .as_ref()
+                                        .and_then(|c| c.name.as_ref())
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("Unknown");
+                                    log::info!(
+                                        "     └─ {} (Components: {}, Referenced by: {})",
+                                        name,
+                                        node.sbom.components.len(),
+                                        node.referenced_by.len()
+                                    );
+                                    log::info!(
+                                        "        Serial: {}",
+                                        node.sbom.serial_number
+                                    );
+                                }
+                                log::info!("");
+                            }
+                        }
+                    }
+                    log::info!("================================================");
+
+                    // Generate JSON output for ancestors
+                    let json_output = corr.hierarchies_to_json(&hierarchies);
+                    let output_file = "ancestor_hierarchy_output.json";
+                    match serde_json::to_string_pretty(&json_output) {
+                        Ok(json_string) => {
+                            match std::fs::write(output_file, json_string) {
+                                Ok(_) => {
+                                    log::info!("\n✅ Ancestor hierarchical JSON output written to: {}", output_file);
                                 }
                                 Err(e) => {
                                     log::error!("Failed to write JSON file: {}", e);

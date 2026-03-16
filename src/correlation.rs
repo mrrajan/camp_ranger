@@ -314,7 +314,51 @@ impl SbomCorrelation {
         filtered_nodes
     }
 
-    /// Get the complete SBOM hierarchy starting from CPE-matching SBOMs
+    /// Find SBOM nodes by PURL (matches by SHA256 for OCI packages or exact match)
+    pub fn get_sbom_node_by_purl(&self, purl: &str) -> Vec<SbomWithRank> {
+        let mut filtered_nodes: Vec<SbomWithRank> = Vec::new();
+
+        for node in self.nodes.values() {
+            // Check metadata component purl
+            if let Some(component) = &node.sbom.metadata.component {
+                if let Some(node_purl) = &component.purl {
+                    // Try SHA256 matching for OCI packages, fallback to exact match
+                    if purls_match_by_sha256(purl, node_purl) || purl == node_purl {
+                        filtered_nodes.push(node.clone());
+                        continue;
+                    }
+                }
+            }
+
+            // Also check components within the SBOM
+            for component in &node.sbom.components {
+                if let Some(component_purl) = &component.purl {
+                    if purls_match_by_sha256(purl, component_purl) || purl == component_purl {
+                        filtered_nodes.push(node.clone());
+                        break;
+                    }
+                }
+
+                // Check pedigree variants
+                if let Some(pedigree) = &component.pedigree {
+                    if let Some(variants) = &pedigree.variants {
+                        for variant in variants {
+                            if let Some(variant_purl) = &variant.purl {
+                                if purls_match_by_sha256(purl, variant_purl) || purl == variant_purl {
+                                    filtered_nodes.push(node.clone());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        filtered_nodes
+    }
+
+    /// Get the complete SBOM hierarchy starting from CPE-matching SBOMs (descendants)
     /// Returns a Vec of hierarchies, where each hierarchy is a Vec of SBOMs starting from one CPE-matching node
     pub fn get_sbom_hierarchy_by_cpe(&self, cpe: &str) -> Vec<Vec<SbomWithRank>> {
         let initial_nodes = self.get_sbom_node_by_cpe(cpe);
@@ -343,7 +387,65 @@ impl SbomCorrelation {
         hierarchies
     }
 
-    /// Recursively collect a node and all its references
+    /// Get the complete SBOM hierarchy starting from PURL-matching SBOMs (descendants)
+    /// Returns a Vec of hierarchies, where each hierarchy is a Vec of SBOMs starting from one PURL-matching node
+    pub fn get_sbom_hierarchy_by_purl(&self, purl: &str) -> Vec<Vec<SbomWithRank>> {
+        let initial_nodes = self.get_sbom_node_by_purl(purl);
+
+        if initial_nodes.is_empty() {
+            log::warn!("No SBOMs found matching PURL: {}", purl);
+            return Vec::new();
+        }
+
+        let mut hierarchies = Vec::new();
+
+        for node in initial_nodes {
+            let mut hierarchy = Vec::new();
+            let mut visited = HashSet::new();
+            self.collect_references_recursive(&node, &mut hierarchy, &mut visited);
+            hierarchies.push(hierarchy);
+        }
+
+        let total_sboms: usize = hierarchies.iter().map(|h| h.len()).sum();
+        log::info!(
+            "Collected {} hierarchies with {} total SBOMs for PURL: {}",
+            hierarchies.len(),
+            total_sboms,
+            purl
+        );
+        hierarchies
+    }
+
+    /// Get ancestor hierarchy starting from PURL-matching SBOMs (going upward)
+    /// Returns a Vec of hierarchies, where each hierarchy is a Vec of SBOMs going up to the root
+    pub fn get_sbom_ancestors_by_purl(&self, purl: &str) -> Vec<Vec<SbomWithRank>> {
+        let initial_nodes = self.get_sbom_node_by_purl(purl);
+
+        if initial_nodes.is_empty() {
+            log::warn!("No SBOMs found matching PURL: {}", purl);
+            return Vec::new();
+        }
+
+        let mut hierarchies = Vec::new();
+
+        for node in initial_nodes {
+            let mut hierarchy = Vec::new();
+            let mut visited = HashSet::new();
+            self.collect_ancestors_recursive(&node, &mut hierarchy, &mut visited);
+            hierarchies.push(hierarchy);
+        }
+
+        let total_sboms: usize = hierarchies.iter().map(|h| h.len()).sum();
+        log::info!(
+            "Collected {} ancestor hierarchies with {} total SBOMs for PURL: {}",
+            hierarchies.len(),
+            total_sboms,
+            purl
+        );
+        hierarchies
+    }
+
+    /// Recursively collect a node and all its references (descendants)
     fn collect_references_recursive(
         &self,
         node: &SbomWithRank,
@@ -379,6 +481,46 @@ impl SbomCorrelation {
                 self.collect_references_recursive(child_node, result, visited);
             } else {
                 log::warn!("Referenced SBOM not found: {}", child_serial);
+            }
+        }
+    }
+
+    /// Recursively collect a node and all its ancestors (going upward)
+    fn collect_ancestors_recursive(
+        &self,
+        node: &SbomWithRank,
+        result: &mut Vec<SbomWithRank>,
+        visited: &mut HashSet<String>,
+    ) {
+        // Skip if already visited
+        if visited.contains(&node.sbom.serial_number) {
+            return;
+        }
+
+        // Mark as visited and add to result
+        visited.insert(node.sbom.serial_number.clone());
+        result.push(node.clone());
+
+        if node.rank == 0 {
+            log::info!(
+                "Including disconnected node (rank 0): {}",
+                node.sbom.serial_number
+            );
+        }
+
+        log::debug!(
+            "Collected rank {} SBOM: {} (referenced_by: {})",
+            node.rank,
+            node.sbom.serial_number,
+            node.referenced_by.len()
+        );
+
+        // Recursively process all parent references (going upward)
+        for parent_serial in &node.referenced_by {
+            if let Some(parent_node) = self.nodes.get(parent_serial) {
+                self.collect_ancestors_recursive(parent_node, result, visited);
+            } else {
+                log::warn!("Parent SBOM not found: {}", parent_serial);
             }
         }
     }
