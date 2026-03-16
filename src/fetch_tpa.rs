@@ -95,6 +95,7 @@ pub async fn get_individual_sbom(
         log::info!("Individual SBOM request successful");
         let response_text = response.text().await?;
         let body: crate::tpa_sbom::TpaSbom = serde_json::from_str(&response_text)?;
+
         Ok(body)
     } else {
         log::error!("Individual SBOM request status: {}", response.status());
@@ -113,8 +114,13 @@ pub fn save_sbom_to_file(
     let filename = format!(
         "{}/{}_{}.json",
         output_dir,
-        sbom.metadata.component.as_ref().and_then(|c| c.name.clone()).unwrap_or("unknown".to_string()).replace("/", "_"),
-       sbom.serial_number.replace(":", "_").replace("/", "_")
+        sbom.metadata
+            .component
+            .as_ref()
+            .and_then(|c| c.name.clone())
+            .unwrap_or("unknown".to_string())
+            .replace("/", "_"),
+        sbom.serial_number.replace(":", "_").replace("/", "_")
     );
     let json = serde_json::to_string_pretty(sbom)?;
     std::fs::write(&filename, json)?;

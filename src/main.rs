@@ -1,6 +1,7 @@
 use clap::{Arg, Command};
 use log::info;
 use simplelog::*;
+mod compare;
 mod correlation;
 mod fetch_tpa;
 mod tpa_sbom;
@@ -18,34 +19,36 @@ pub struct TpaConfig {
 #[tokio::main]
 async fn main() {
     let matches = Command::new("camp_ranger")
-        .about("SBOM correlation tool - fetches and correlates SBOMs from TPA API or local directory")
+        .about(
+            "SBOM correlation tool - fetches and correlates SBOMs from TPA API or local directory",
+        )
         .arg(
             Arg::new("tpa_api_url")
-                .short('u')
+                .short('a')
                 .long("tpa_api_url")
                 .help("TPA Application API URL")
-                .required_unless_present("sbom_dir"),
+                .required_unless_present_any(["sbom_dir", "compare"]),
         )
         .arg(
             Arg::new("issuer_url")
-                .short('i')
+                .short('u')
                 .long("issuer_url")
                 .help("OIDC Issuer URL for authentication")
-                .required_unless_present("sbom_dir"),
+                .required_unless_present_any(["sbom_dir", "compare"]),
         )
         .arg(
             Arg::new("tpa_api_client_id")
-                .short('c')
+                .short('i')
                 .long("tpa_api_client_id")
                 .help("TPA API Client ID")
-                .required_unless_present("sbom_dir"),
+                .required_unless_present_any(["sbom_dir", "compare"]),
         )
         .arg(
             Arg::new("tpa_api_client_secret")
                 .short('s')
                 .long("tpa_api_client_secret")
                 .help("TPA API Client Secret")
-                .required_unless_present("sbom_dir"),
+                .required_unless_present_any(["sbom_dir", "compare"]),
         )
         .arg(
             Arg::new("accept_invalid_certs")
@@ -59,10 +62,36 @@ async fn main() {
                 .short('d')
                 .long("sbom_dir")
                 .help("Directory containing SBOM JSON files (offline mode)")
-                .conflicts_with_all(["tpa_api_url", "issuer_url", "tpa_api_client_id", "tpa_api_client_secret"]),
+                .conflicts_with_all([
+                    "tpa_api_url",
+                    "issuer_url",
+                    "tpa_api_client_id",
+                    "tpa_api_client_secret",
+                ]),
+        )
+        .arg(
+            Arg::new("cpe")
+                .short('c')
+                .long("cpe")
+                .help("CPE to filter SBOMs")
+                .required(false),
+        )
+        .arg(
+            Arg::new("compare")
+                .long("compare")
+                .help("Compare Atlas API response with tool output")
+                .num_args(2)
+                .value_names(["ATLAS_FILE", "TOOL_FILE"])
+                .conflicts_with_all([
+                    "tpa_api_url",
+                    "issuer_url",
+                    "tpa_api_client_id",
+                    "tpa_api_client_secret",
+                    "sbom_dir",
+                    "cpe",
+                ]),
         )
         .get_matches();
-
 
     CombinedLogger::init(vec![
         TermLogger::new(
@@ -78,6 +107,26 @@ async fn main() {
         ),
     ])
     .unwrap();
+
+    // Handle compare mode if --compare flag is provided
+    if let Some(compare_args) = matches.get_many::<String>("compare") {
+        let args: Vec<&String> = compare_args.collect();
+        if args.len() == 2 {
+            let atlas_file = args[0].as_str();
+            let tool_file = args[1].as_str();
+
+            match compare::compare_and_export(atlas_file, tool_file) {
+                Ok(_) => {
+                    info!("Comparison completed successfully");
+                }
+                Err(e) => {
+                    log::error!("Comparison failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+    }
 
     let correlation = if let Some(sbom_dir) = matches.get_one::<String>("sbom_dir") {
         // Offline mode: read from directory
@@ -99,28 +148,118 @@ async fn main() {
             accept_invalid_certs: matches.get_flag("accept_invalid_certs"),
             sbom_output_dir: "sboms".to_string(),
         };
-        info!("Fetching SBOMs from API and saving to: {}", config.sbom_output_dir);
+        info!(
+            "Fetching SBOMs from API and saving to: {}",
+            config.sbom_output_dir
+        );
         correlation::SbomCorrelation::build_from_api(&config).await
     };
 
     match correlation {
         Ok(corr) => {
-            info!("Correlation built successfully with {} SBOMs", corr.nodes.len());
-            info!("Maximum rank: {}", corr.max_rank());
+            if let Some(cpe) = matches.get_one::<String>("cpe") {
+                let hierarchies = corr.get_sbom_hierarchy_by_cpe(cpe);
+                if hierarchies.is_empty() {
+                    log::error!("CPE not found in any SBOM");
+                } else {
+                    log::info!("================================================");
+                    log::info!("Found {} hierarchy tree(s) for CPE: {}", hierarchies.len(), cpe);
+                    log::info!("================================================\n");
 
-            for rank in 1..=corr.max_rank() {
-                let sboms_at_rank = corr.get_by_rank(rank);
-                info!("Rank {}: {} SBOM(s)", rank, sboms_at_rank.len());
-                for sbom_node in sboms_at_rank {
-                    let name = sbom_node.sbom.metadata.component.as_ref()
-                        .and_then(|c| c.name.as_ref())
-                        .map(|s| s.as_str())
-                        .unwrap_or("Unknown");
-                    info!("  - {} (referenced by: {}, references: {})",
-                        name,
-                        sbom_node.referenced_by.len(),
-                        sbom_node.references.len()
-                    );
+                    // Display each hierarchy tree separately
+                    for (idx, hierarchy) in hierarchies.iter().enumerate() {
+                        let root_node = &hierarchy[0];
+                        let root_name = root_node
+                            .sbom
+                            .metadata
+                            .component
+                            .as_ref()
+                            .and_then(|c| c.name.as_ref())
+                            .map(|s| s.as_str())
+                            .unwrap_or("Unknown");
+
+                        log::info!("╔════════════════════════════════════════════════");
+                        log::info!("║ Hierarchy #{}: {} ({})", idx + 1, root_name, root_node.sbom.serial_number);
+                        log::info!("║ Total SBOMs in tree: {}", hierarchy.len());
+                        log::info!("╚════════════════════════════════════════════════\n");
+
+                        // Group by rank within this hierarchy
+                        let max_rank = hierarchy.iter().map(|n| n.rank).max().unwrap_or(0);
+                        for rank in 1..=max_rank {
+                            let nodes_at_rank: Vec<_> = hierarchy.iter().filter(|n| n.rank == rank).collect();
+                            if !nodes_at_rank.is_empty() {
+                                log::info!("  📊 Rank {} ({} SBOM(s)):", rank, nodes_at_rank.len());
+                                for node in nodes_at_rank {
+                                    let name = node
+                                        .sbom
+                                        .metadata
+                                        .component
+                                        .as_ref()
+                                        .and_then(|c| c.name.as_ref())
+                                        .map(|s| s.as_str())
+                                        .unwrap_or("Unknown");
+                                    log::info!(
+                                        "     └─ {} (Components: {}, References: {})",
+                                        name,
+                                        node.sbom.components.len(),
+                                        node.references.len()
+                                    );
+                                    log::info!(
+                                        "        Serial: {}",
+                                        node.sbom.serial_number
+                                    );
+                                }
+                                log::info!("");
+                            }
+                        }
+                    }
+                    log::info!("================================================");
+
+                    // Generate JSON output
+                    let json_output = corr.hierarchies_to_json(&hierarchies);
+                    let output_file = "hierarchy_output.json";
+                    match serde_json::to_string_pretty(&json_output) {
+                        Ok(json_string) => {
+                            match std::fs::write(output_file, json_string) {
+                                Ok(_) => {
+                                    log::info!("\n✅ Hierarchical JSON output written to: {}", output_file);
+                                }
+                                Err(e) => {
+                                    log::error!("Failed to write JSON file: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Failed to serialize JSON: {}", e);
+                        }
+                    }
+                }
+            } else {
+                info!(
+                    "Correlation built successfully with {} SBOMs",
+                    corr.nodes.len()
+                );
+                info!("Maximum rank: {}", corr.max_rank());
+
+                for rank in 1..=corr.max_rank() {
+                    let sboms_at_rank = corr.get_by_rank(rank);
+                    info!("Rank {}: {} SBOM(s)", rank, sboms_at_rank.len());
+                    for sbom_node in sboms_at_rank {
+                        let name = sbom_node
+                            .sbom
+                            .metadata
+                            .component
+                            .as_ref()
+                            .and_then(|c| c.name.as_ref())
+                            .map(|s| s.as_str())
+                            .unwrap_or("Unknown");
+                        info!(
+                            "  - {} (referenced by: {}, references: {})",
+                            name,
+                            sbom_node.referenced_by.len(),
+                            sbom_node.references.len()
+                        );
+                    }
                 }
             }
         }
