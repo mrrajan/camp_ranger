@@ -54,34 +54,134 @@ pub fn purls_match_by_sha256(purl1: &str, purl2: &str) -> bool {
     }
 }
 
-/// Extract name and version from a purl string
+/// Extract name and version from a purl string.
+/// Name extraction is type-aware:
+///   - golang: namespace/name + subpath (full module path)
+///   - others (rpm, etc.): leaf name only (after last /)
+/// Version is URL-decoded with epoch qualifier prepended if present.
 /// Examples:
-///   pkg:golang/github.com/beorn7/perks@v1.0.1?package-id=xxx -> ("perks", "v1.0.1")
-///   pkg:rpm/redhat/zlib@1.2.11-40.el9?arch=aarch64 -> ("zlib", "1.2.11-40.el9")
+///   pkg:golang/github.com/beorn7/perks@v1.0.1?package-id=xxx -> ("github.com/beorn7/perks", "v1.0.1")
+///   pkg:golang/github.com/kubernetes-csi/external-snapshotter@v4.2.0#client/v4 -> ("github.com/kubernetes-csi/external-snapshotter/client/v4", "v4.2.0")
+///   pkg:rpm/redhat/zlib@1.2.11-40.el9?arch=aarch64&epoch=1 -> ("zlib", "1:1.2.11-40.el9")
+///   pkg:golang/github.com/evanphx/json-patch@v5.6.0%2Bincompatible -> ("github.com/evanphx/json-patch", "v5.6.0+incompatible")
 fn extract_name_version_from_purl(purl: &str) -> (String, String) {
-    // Split by '@' to separate name from version+qualifiers
     if let Some(at_pos) = purl.rfind('@') {
         let name_part = &purl[..at_pos];
-        let version_part = &purl[at_pos + 1..];
+        let version_and_rest = &purl[at_pos + 1..];
 
-        // Extract version (before '?' if present)
-        let version = if let Some(query_pos) = version_part.find('?') {
-            version_part[..query_pos].to_string()
+        // Split version from qualifiers+subpath
+        let (version_raw, qualifiers_str) = if let Some(query_pos) = version_and_rest.find('?') {
+            (&version_and_rest[..query_pos], Some(&version_and_rest[query_pos + 1..]))
         } else {
-            version_part.to_string()
+            (version_and_rest, None)
         };
 
-        // Extract name (after last '/')
-        let name = if let Some(slash_pos) = name_part.rfind('/') {
-            name_part[slash_pos + 1..].to_string()
+        // Extract #subpath (can appear after version or after qualifiers)
+        let subpath = version_raw.find('#').map(|pos| &version_raw[pos + 1..])
+            .or_else(|| {
+                qualifiers_str.and_then(|qs| qs.find('#').map(|pos| &qs[pos + 1..]))
+            });
+
+        // Strip #subpath from version
+        let version_raw = if let Some(hash_pos) = version_raw.find('#') {
+            &version_raw[..hash_pos]
         } else {
-            name_part.to_string()
+            version_raw
         };
+
+        // URL-decode the version
+        let version_decoded = urlencoding::decode(version_raw)
+            .unwrap_or(std::borrow::Cow::Borrowed(version_raw))
+            .into_owned();
+
+        // Check for epoch qualifier and prepend to version
+        let epoch = qualifiers_str.and_then(|qs| {
+            let qs = if let Some(hash_pos) = qs.find('#') { &qs[..hash_pos] } else { qs };
+            qs.split('&')
+                .find_map(|pair| {
+                    let mut kv = pair.splitn(2, '=');
+                    match (kv.next(), kv.next()) {
+                        (Some("epoch"), Some(v)) => Some(v.to_string()),
+                        _ => None,
+                    }
+                })
+        });
+
+        let version = match epoch {
+            Some(e) => format!("{}:{}", e, version_decoded),
+            None => version_decoded,
+        };
+
+        // Determine PURL type for type-aware name extraction
+        let is_golang = name_part.starts_with("pkg:golang/");
+
+        let name = if is_golang {
+            // golang: use full namespace/name path, append subpath if present
+            let base = if let Some(slash_pos) = name_part.find('/') {
+                &name_part[slash_pos + 1..]
+            } else {
+                name_part
+            };
+            match subpath {
+                Some(sp) if !sp.is_empty() => format!("{}/{}", base, sp),
+                _ => base.to_string(),
+            }
+        } else {
+            // rpm, oci, etc.: use leaf name only (after last /)
+            if let Some(slash_pos) = name_part.rfind('/') {
+                name_part[slash_pos + 1..].to_string()
+            } else {
+                name_part.to_string()
+            }
+        };
+
+        // URL-decode the name
+        let name = urlencoding::decode(&name)
+            .unwrap_or(std::borrow::Cow::Borrowed(&name))
+            .into_owned();
 
         (name, version)
     } else {
-        // No version found, use entire purl as name
-        (purl.to_string(), String::new())
+        // No @version — extract name from the purl path
+        // Strip ?qualifiers and #subpath first
+        let purl_clean = if let Some(query_pos) = purl.find('?') {
+            &purl[..query_pos]
+        } else {
+            purl
+        };
+        let purl_without_subpath = if let Some(hash_pos) = purl_clean.find('#') {
+            &purl_clean[..hash_pos]
+        } else {
+            purl_clean
+        };
+        let is_golang = purl_without_subpath.starts_with("pkg:golang/");
+        let subpath = purl_clean.find('#').map(|pos| &purl_clean[pos + 1..])
+            .or_else(|| purl.find('#').map(|pos| {
+                let rest = &purl[pos + 1..];
+                if let Some(q) = rest.find('?') { &rest[..q] } else { rest }
+            }));
+
+        let name = if is_golang {
+            let base = if let Some(slash_pos) = purl_without_subpath.find('/') {
+                &purl_without_subpath[slash_pos + 1..]
+            } else {
+                purl_without_subpath
+            };
+            match subpath {
+                Some(sp) if !sp.is_empty() => format!("{}/{}", base, sp),
+                _ => base.to_string(),
+            }
+        } else if let Some(slash_pos) = purl_without_subpath.rfind('/') {
+            purl_without_subpath[slash_pos + 1..].to_string()
+        } else {
+            purl_without_subpath.to_string()
+        };
+
+        let name = urlencoding::decode(&name)
+            .unwrap_or(std::borrow::Cow::Borrowed(&name))
+            .into_owned();
+
+        (name, String::new())
     }
 }
 
@@ -523,6 +623,63 @@ impl SbomCorrelation {
                 log::warn!("Parent SBOM not found: {}", parent_serial);
             }
         }
+    }
+
+    /// Filter hierarchies to keep only the one with the most recent root timestamp.
+    /// Groups by root component name, then picks the hierarchy whose root SBOM has the latest
+    /// metadata.timestamp.
+    pub fn filter_latest_hierarchy(
+        &self,
+        hierarchies: Vec<Vec<SbomWithRank>>,
+    ) -> Vec<Vec<SbomWithRank>> {
+        if hierarchies.len() <= 1 {
+            return hierarchies;
+        }
+
+        let mut by_name: HashMap<String, Vec<(String, Vec<SbomWithRank>)>> = HashMap::new();
+
+        for hierarchy in hierarchies {
+            if let Some(root) = hierarchy.first() {
+                let name = root
+                    .sbom
+                    .metadata
+                    .component
+                    .as_ref()
+                    .and_then(|c| c.name.clone())
+                    .unwrap_or_else(|| root.sbom.serial_number.clone());
+
+                let timestamp = root
+                    .sbom
+                    .metadata
+                    .timestamp
+                    .clone()
+                    .unwrap_or_default();
+
+                by_name
+                    .entry(name)
+                    .or_default()
+                    .push((timestamp, hierarchy));
+            }
+        }
+
+        let mut result = Vec::new();
+        for (name, mut entries) in by_name {
+            entries.sort_by(|a, b| b.0.cmp(&a.0));
+            if let Some((ts, hierarchy)) = entries.into_iter().next() {
+                log::info!(
+                    "Latest hierarchy for '{}': timestamp={}",
+                    name,
+                    ts
+                );
+                result.push(hierarchy);
+            }
+        }
+
+        log::info!(
+            "Filtered to {} latest hierarchy/hierarchies",
+            result.len()
+        );
+        result
     }
 
     /// Convert hierarchies to JSON output format
@@ -978,5 +1135,59 @@ mod tests {
 
         let purl3 = "pkg:oci/name@sha256:different?arch=amd64";
         assert!(!purls_match_by_sha256(purl1, purl3));
+    }
+
+    #[test]
+    fn test_extract_name_version_golang() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:golang/github.com/beorn7/perks@v1.0.1?package-id=d6fd5b144cc18be1",
+        );
+        assert_eq!(name, "github.com/beorn7/perks");
+        assert_eq!(version, "v1.0.1");
+    }
+
+    #[test]
+    fn test_extract_name_version_rpm_with_epoch() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:rpm/redhat/gdbm-libs@1.19-4.el9?arch=x86_64&epoch=1",
+        );
+        assert_eq!(name, "gdbm-libs");
+        assert_eq!(version, "1:1.19-4.el9");
+    }
+
+    #[test]
+    fn test_extract_name_version_url_decode() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:golang/github.com/evanphx/json-patch@v5.6.0%2Bincompatible?package-id=abc",
+        );
+        assert_eq!(name, "github.com/evanphx/json-patch");
+        assert_eq!(version, "v5.6.0+incompatible");
+    }
+
+    #[test]
+    fn test_extract_name_version_with_subpath() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:golang/github.com/google/renameio@v2.0.0#v2",
+        );
+        assert_eq!(name, "github.com/google/renameio/v2");
+        assert_eq!(version, "v2.0.0");
+    }
+
+    #[test]
+    fn test_extract_name_version_simple_rpm() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:rpm/redhat/zlib@1.2.11-40.el9?arch=aarch64",
+        );
+        assert_eq!(name, "zlib");
+        assert_eq!(version, "1.2.11-40.el9");
+    }
+
+    #[test]
+    fn test_extract_name_version_golang_with_subpath() {
+        let (name, version) = extract_name_version_from_purl(
+            "pkg:golang/github.com/kubernetes-csi/external-snapshotter@v4.2.0#client/v4",
+        );
+        assert_eq!(name, "github.com/kubernetes-csi/external-snapshotter/client/v4");
+        assert_eq!(version, "v4.2.0");
     }
 }

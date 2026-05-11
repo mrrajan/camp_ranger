@@ -1,39 +1,121 @@
 # Camp Ranger
 
-SBOM correlation tool that fetches and correlates Software Bill of Materials (SBOMs) from TPA API or local directory.
+Independent verification tool for TPA (Trustify) SBOM hierarchy analysis. Fetches raw SBOMs, reconstructs component hierarchies from first principles using SHA256 hash matching, and compares the result against the TPA API's own analysis endpoint to validate correctness.
 
-## Overview
+## Purpose
 
-Camp Ranger analyzes and correlates SBOMs to build a dependency graph, ranking components based on their relationships. It supports both online mode (fetching from TPA API) and offline mode (reading from local directory).
+The TPA API builds SBOM hierarchies via a pre-computed graph database. Camp Ranger takes the same raw SBOM inputs through a completely independent code path — Rust-based hash matching and BFS traversal — and verifies that both arrive at the same answer. This serves as an oracle for the API: if both implementations agree, the API's ingestion pipeline, graph construction, and traversal are correct.
 
-## How to Run
+## Modes
 
-### Build
+### 1. Hierarchy Building
+
+Fetch SBOMs and build the component hierarchy locally.
+
+**Online (from TPA API):**
+```bash
+cargo run -- \
+  --tpa_api_url http://localhost:8080 \
+  --cpe "cpe:/a:redhat:container_native_virtualization:4.17::el9"
+```
+
+**Offline (from local directory):**
+```bash
+cargo run -- --sbom_dir sboms/ \
+  --cpe "cpe:/a:redhat:container_native_virtualization:4.17::el9"
+```
+
+Authentication is optional. For authenticated TPA instances, add `--issuer_url`, `--tpa_api_client_id`, and `--tpa_api_client_secret`. Use `-k` to accept self-signed certificates.
+
+**Query by PURL (ancestor traversal):**
+```bash
+cargo run -- --sbom_dir sboms/ \
+  --purl "pkg:oci/virt-handler-rhel9@sha256:abc123..."
+```
+
+**Filter to latest SBOM only:**
+```bash
+cargo run -- --sbom_dir sboms/ \
+  --cpe "cpe:/a:redhat:container_native_virtualization:4.17::el9" \
+  --latest
+```
+
+### 2. Live Comparison (`--live-compare`)
+
+Fetch the TPA API's analysis response and compare it against the tool's own hierarchy in a single run.
+
+```bash
+cargo run -- \
+  --tpa_api_url http://localhost:8080 \
+  --sbom_dir sboms/ \
+  --cpe "cpe:/a:redhat:container_native_virtualization:4.17::el9" \
+  --live-compare
+```
+
+With `--latest`, uses the `/api/v2/analysis/latest/component/` endpoint and filters the tool's output to the most recent hierarchy:
+
+```bash
+cargo run -- \
+  --tpa_api_url http://localhost:8080 \
+  --sbom_dir sboms/ \
+  --cpe "cpe:/a:redhat:container_native_virtualization:4.17::el9" \
+  --live-compare --latest
+```
+
+### 3. File-Based Comparison (`--compare`)
+
+Compare a previously saved API response against a tool output file.
+
+```bash
+cargo run -- --compare atlas_response/atlas_response.json hierarchy_output.json
+```
+
+## Output Files
+
+| File | Description |
+|------|-------------|
+| `hierarchy_output.json` | Tool's hierarchy (CPE descendant query) |
+| `ancestor_hierarchy_output.json` | Tool's hierarchy (PURL ancestor query) |
+| `api_analysis_response.json` | API response (saved during `--live-compare`) |
+| `tool_hierarchy_output.json` | Tool output (saved during `--live-compare`) |
+| `comparison_report.md` | Markdown report with summary, field mismatches, structural diffs |
+| `missing_in_tool.csv` | Nodes in API but not in tool output |
+| `missing_in_api.csv` | Nodes in tool output but not in API |
+| `field_mismatches.csv` | Per-field differences for matched nodes (name, version, purl, cpe, relationship) |
+| `camp_ranger_sbom.log` | Debug log |
+
+## Comparison Logic
+
+The comparison normalizes both trees before diffing:
+
+- **Node ID normalization**: URL-decodes `node_id` values (`%3A` -> `:`)
+- **PURL normalization**: URL-decodes and strips query parameters before comparing
+- **Field-level comparison**: For matched nodes, compares name, version, purl, cpe, and relationship
+- **Structural comparison**: Verifies parent-child relationships match between the two trees
+
+## CLI Reference
+
+| Flag | Description |
+|------|-------------|
+| `-a, --tpa_api_url` | TPA API URL (required unless `--sbom_dir` or `--compare`) |
+| `-u, --issuer_url` | OIDC issuer URL (optional, for authenticated instances) |
+| `-i, --tpa_api_client_id` | API client ID (optional) |
+| `-s, --tpa_api_client_secret` | API client secret (optional) |
+| `-k, --accept_invalid_certs` | Accept self-signed SSL certificates |
+| `-d, --sbom_dir` | Directory containing SBOM JSON files (offline mode) |
+| `-c, --cpe` | CPE to query (retrieves descendants) |
+| `-p, --purl` | PURL to query (retrieves ancestors) |
+| `--latest` | Filter to latest hierarchy; uses `/latest/` API endpoint |
+| `--live-compare` | Fetch from API + build own hierarchy + compare |
+| `--compare <API_FILE> <TOOL_FILE>` | Compare two saved JSON files |
+
+## Build
 
 ```bash
 cargo build --release
 ```
 
-### Run - Online Mode (Fetch from TPA API)
+## Dependencies
 
-```bash
-cargo run -- \
-  --tpa_api_url <TPA_API_URL> \
-  --issuer_url <OIDC_ISSUER_URL> \
-  --tpa_api_client_id <CLIENT_ID> \
-  --tpa_api_client_secret <CLIENT_SECRET>
-```
-
-Add `--accept_invalid_certs` flag to accept self-signed SSL certificates (insecure).
-
-### Run - Offline Mode (Read from Directory)
-
-```bash
-cargo run -- --sbom_dir <PATH_TO_SBOM_DIR>
-```
-
-## Output
-
-- SBOMs are saved to `sboms/` directory (online mode)
-- Logs are written to `camp_ranger_sbom.log`
-- Console output shows correlation results with component rankings
+- Rust 2021 edition
+- tokio, reqwest, serde, clap, csv, chrono, urlencoding

@@ -9,9 +9,9 @@ mod tpa_sbom;
 #[derive(Debug, Clone)]
 pub struct TpaConfig {
     pub tpa_api_url: String,
-    pub issuer_url: String,
-    pub tpa_api_client_id: String,
-    pub tpa_api_client_secret: String,
+    pub issuer_url: Option<String>,
+    pub tpa_api_client_id: Option<String>,
+    pub tpa_api_client_secret: Option<String>,
     pub accept_invalid_certs: bool,
     pub sbom_output_dir: String,
 }
@@ -33,22 +33,19 @@ async fn main() {
             Arg::new("issuer_url")
                 .short('u')
                 .long("issuer_url")
-                .help("OIDC Issuer URL for authentication")
-                .required_unless_present_any(["sbom_dir", "compare"]),
+                .help("OIDC Issuer URL for authentication (optional for no-auth instances)"),
         )
         .arg(
             Arg::new("tpa_api_client_id")
                 .short('i')
                 .long("tpa_api_client_id")
-                .help("TPA API Client ID")
-                .required_unless_present_any(["sbom_dir", "compare"]),
+                .help("TPA API Client ID (optional for no-auth instances)"),
         )
         .arg(
             Arg::new("tpa_api_client_secret")
                 .short('s')
                 .long("tpa_api_client_secret")
-                .help("TPA API Client Secret")
-                .required_unless_present_any(["sbom_dir", "compare"]),
+                .help("TPA API Client Secret (optional for no-auth instances)"),
         )
         .arg(
             Arg::new("accept_invalid_certs")
@@ -61,13 +58,7 @@ async fn main() {
             Arg::new("sbom_dir")
                 .short('d')
                 .long("sbom_dir")
-                .help("Directory containing SBOM JSON files (offline mode)")
-                .conflicts_with_all([
-                    "tpa_api_url",
-                    "issuer_url",
-                    "tpa_api_client_id",
-                    "tpa_api_client_secret",
-                ]),
+                .help("Directory containing SBOM JSON files (offline mode)"),
         )
         .arg(
             Arg::new("cpe")
@@ -100,6 +91,19 @@ async fn main() {
                     "cpe",
                     "purl",
                 ]),
+        )
+        .arg(
+            Arg::new("live_compare")
+                .long("live-compare")
+                .help("Fetch analysis from TPA API and compare against tool's own hierarchy")
+                .action(clap::ArgAction::SetTrue)
+                .requires("tpa_api_url"),
+        )
+        .arg(
+            Arg::new("latest")
+                .long("latest")
+                .help("Filter to only the latest SBOM hierarchy; uses /latest/ API endpoint with --live-compare")
+                .action(clap::ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -138,6 +142,149 @@ async fn main() {
         }
     }
 
+    // Handle live-compare mode
+    if matches.get_flag("live_compare") {
+        let cpe = matches.get_one::<String>("cpe");
+        let purl = matches.get_one::<String>("purl");
+        let use_latest = matches.get_flag("latest");
+
+        if cpe.is_none() && purl.is_none() {
+            log::error!("--live-compare requires either --cpe or --purl");
+            std::process::exit(1);
+        }
+
+        let config = TpaConfig {
+            tpa_api_url: matches.get_one::<String>("tpa_api_url").unwrap().clone(),
+            issuer_url: matches.get_one::<String>("issuer_url").cloned(),
+            tpa_api_client_id: matches.get_one::<String>("tpa_api_client_id").cloned(),
+            tpa_api_client_secret: matches.get_one::<String>("tpa_api_client_secret").cloned(),
+            accept_invalid_certs: matches.get_flag("accept_invalid_certs"),
+            sbom_output_dir: "sboms".to_string(),
+        };
+
+        // Build tool's own hierarchy
+        let correlation = if let Some(sbom_dir) = matches.get_one::<String>("sbom_dir") {
+            info!("Loading SBOMs from directory: {}", sbom_dir);
+            correlation::SbomCorrelation::build_from_dir(sbom_dir)
+        } else {
+            info!("Fetching SBOMs from API...");
+            correlation::SbomCorrelation::build_from_api(&config).await
+        };
+
+        let corr = match correlation {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("Failed to build correlation: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let (api_json, tool_json) = if let Some(cpe) = cpe {
+            info!(
+                "Fetching {}analysis from API for CPE: {}",
+                if use_latest { "latest " } else { "" },
+                cpe
+            );
+            let analysis = if use_latest {
+                fetch_tpa::fetch_latest_analysis_by_cpe(&config, cpe).await
+            } else {
+                fetch_tpa::fetch_analysis_by_cpe(&config, cpe).await
+            };
+            let analysis = match analysis {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("Failed to fetch analysis from API: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let api_json = serde_json::to_value(&analysis).unwrap();
+
+            let hierarchies = corr.get_sbom_hierarchy_by_cpe(cpe);
+            let hierarchies = if use_latest {
+                corr.filter_latest_hierarchy(hierarchies)
+            } else {
+                hierarchies
+            };
+            let tool_output = corr.hierarchies_to_json(&hierarchies);
+            let tool_json = serde_json::to_value(&tool_output).unwrap();
+
+            // Save both for reference
+            let _ = std::fs::write(
+                "api_analysis_response.json",
+                serde_json::to_string_pretty(&api_json).unwrap(),
+            );
+            let _ = std::fs::write(
+                "tool_hierarchy_output.json",
+                serde_json::to_string_pretty(&tool_json).unwrap(),
+            );
+            info!("Saved API response to api_analysis_response.json");
+            info!("Saved tool output to tool_hierarchy_output.json");
+
+            (api_json, tool_json)
+        } else if let Some(purl) = purl {
+            info!(
+                "Fetching {}analysis from API for PURL: {}",
+                if use_latest { "latest " } else { "" },
+                purl
+            );
+            let analysis = if use_latest {
+                fetch_tpa::fetch_latest_analysis_by_purl(&config, purl).await
+            } else {
+                fetch_tpa::fetch_analysis_by_purl(&config, purl).await
+            };
+            let analysis = match analysis {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("Failed to fetch analysis from API: {}", e);
+                    std::process::exit(1);
+                }
+            };
+            let api_json = serde_json::to_value(&analysis).unwrap();
+
+            let hierarchies = corr.get_sbom_ancestors_by_purl(purl);
+            let hierarchies = if use_latest {
+                corr.filter_latest_hierarchy(hierarchies)
+            } else {
+                hierarchies
+            };
+            let tool_output = corr.hierarchies_to_json(&hierarchies);
+            let tool_json = serde_json::to_value(&tool_output).unwrap();
+
+            let _ = std::fs::write(
+                "api_analysis_response.json",
+                serde_json::to_string_pretty(&api_json).unwrap(),
+            );
+            let _ = std::fs::write(
+                "tool_hierarchy_output.json",
+                serde_json::to_string_pretty(&tool_json).unwrap(),
+            );
+            info!("Saved API response to api_analysis_response.json");
+            info!("Saved tool output to tool_hierarchy_output.json");
+
+            (api_json, tool_json)
+        } else {
+            unreachable!();
+        };
+
+        match compare::compare_hierarchies(&api_json, &tool_json) {
+            Ok(result) => {
+                if let Err(e) = compare::write_markdown_report(&result, "comparison_report.md") {
+                    log::error!("Failed to write report: {}", e);
+                }
+                if let Err(e) = compare::write_csv_outputs(&result) {
+                    log::error!("Failed to write CSVs: {}", e);
+                }
+                compare::print_summary(&result);
+                info!("Live comparison completed successfully");
+            }
+            Err(e) => {
+                log::error!("Comparison failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let correlation = if let Some(sbom_dir) = matches.get_one::<String>("sbom_dir") {
         // Offline mode: read from directory
         info!("Loading SBOMs from directory: {}", sbom_dir);
@@ -146,15 +293,9 @@ async fn main() {
         // Online mode: fetch from API and cache
         let config = TpaConfig {
             tpa_api_url: matches.get_one::<String>("tpa_api_url").unwrap().clone(),
-            issuer_url: matches.get_one::<String>("issuer_url").unwrap().clone(),
-            tpa_api_client_id: matches
-                .get_one::<String>("tpa_api_client_id")
-                .unwrap()
-                .clone(),
-            tpa_api_client_secret: matches
-                .get_one::<String>("tpa_api_client_secret")
-                .unwrap()
-                .clone(),
+            issuer_url: matches.get_one::<String>("issuer_url").cloned(),
+            tpa_api_client_id: matches.get_one::<String>("tpa_api_client_id").cloned(),
+            tpa_api_client_secret: matches.get_one::<String>("tpa_api_client_secret").cloned(),
             accept_invalid_certs: matches.get_flag("accept_invalid_certs"),
             sbom_output_dir: "sboms".to_string(),
         };
@@ -169,6 +310,12 @@ async fn main() {
         Ok(corr) => {
             if let Some(cpe) = matches.get_one::<String>("cpe") {
                 let hierarchies = corr.get_sbom_hierarchy_by_cpe(cpe);
+                let hierarchies = if matches.get_flag("latest") {
+                    info!("Filtering to latest hierarchy only");
+                    corr.filter_latest_hierarchy(hierarchies)
+                } else {
+                    hierarchies
+                };
                 if hierarchies.is_empty() {
                     log::error!("CPE not found in any SBOM");
                 } else {
@@ -246,6 +393,12 @@ async fn main() {
                 }
             } else if let Some(purl) = matches.get_one::<String>("purl") {
                 let hierarchies = corr.get_sbom_ancestors_by_purl(purl);
+                let hierarchies = if matches.get_flag("latest") {
+                    info!("Filtering to latest hierarchy only");
+                    corr.filter_latest_hierarchy(hierarchies)
+                } else {
+                    hierarchies
+                };
                 if hierarchies.is_empty() {
                     log::error!("PURL not found in any SBOM");
                 } else {
