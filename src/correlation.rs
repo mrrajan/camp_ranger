@@ -222,6 +222,8 @@ pub struct HierarchyNode {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub descendants: Vec<HierarchyNode>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub ancestors: Vec<HierarchyNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
 }
 
@@ -276,6 +278,7 @@ impl HierarchyNode {
             published: sbom.metadata.timestamp.clone(),
             relationship: None,
             descendants: Vec::new(),
+            ancestors: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -299,6 +302,7 @@ impl HierarchyNode {
             published: sbom.metadata.timestamp.clone(),
             relationship: Some("generates".to_string()),
             descendants: Vec::new(),
+            ancestors: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -316,6 +320,7 @@ impl HierarchyNode {
             published,
             relationship: Some("dependency".to_string()),
             descendants: Vec::new(),
+            ancestors: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -694,6 +699,86 @@ impl SbomCorrelation {
         }
 
         HierarchyJsonOutput { items }
+    }
+
+    /// Convert hierarchies to JSON output format for ancestor chains.
+    /// Produces nested `ancestors` arrays matching the API's ancestor response shape.
+    /// `target_purl` is the queried PURL placed as the outermost node.
+    pub fn hierarchies_to_ancestor_json(&self, hierarchies: &[Vec<SbomWithRank>], target_purl: &str) -> HierarchyJsonOutput {
+        let mut items = Vec::new();
+
+        for hierarchy in hierarchies {
+            if hierarchy.is_empty() {
+                continue;
+            }
+            let json_node = self.build_ancestor_chain(hierarchy, target_purl);
+            items.push(json_node);
+        }
+
+        HierarchyJsonOutput { items }
+    }
+
+    /// Build a nested ancestor chain from a flat list of SBOMs.
+    /// `target_purl` is placed as the outermost node (depth 0).
+    /// The SBOMs form the ancestor chain nested inside it.
+    /// Output: target_purl { ancestors: [ container { ancestors: [ product { ... } ] } ] }
+    fn build_ancestor_chain(&self, hierarchy: &[SbomWithRank], target_purl: &str) -> HierarchyNode {
+        let mut sorted: Vec<&SbomWithRank> = hierarchy.iter().collect();
+        sorted.sort_by(|a, b| b.rank.cmp(&a.rank));
+
+        let mut current_ancestor: Option<HierarchyNode> = None;
+
+        for sbom_node in sorted.iter().rev() {
+            let node_name = sbom_node
+                .sbom
+                .metadata
+                .component
+                .as_ref()
+                .and_then(|c| c.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let node_id = sbom_node
+                .sbom
+                .metadata
+                .component
+                .as_ref()
+                .and_then(|c| c.purl.clone())
+                .unwrap_or_else(|| node_name.clone());
+
+            let mut node = HierarchyNode::from_sbom(&sbom_node.sbom, node_id);
+            node.name = node_name;
+
+            if let Some(ancestor) = current_ancestor.take() {
+                node.ancestors = vec![ancestor];
+            }
+
+            current_ancestor = Some(node);
+        }
+
+        let sbom_chain = current_ancestor.unwrap_or_else(|| {
+            let node_name = hierarchy[0]
+                .sbom
+                .metadata
+                .component
+                .as_ref()
+                .and_then(|c| c.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
+            HierarchyNode::from_sbom(&hierarchy[0].sbom, node_name)
+        });
+
+        let (name, version) = extract_name_version_from_purl(target_purl);
+        HierarchyNode {
+            node_id: target_purl.to_string(),
+            purl: vec![target_purl.to_string()],
+            cpe: Vec::new(),
+            name,
+            version,
+            published: hierarchy.first().and_then(|h| h.sbom.metadata.timestamp.clone()),
+            relationship: None,
+            descendants: Vec::new(),
+            ancestors: vec![sbom_chain],
+            warnings: Vec::new(),
+        }
     }
 
     /// Recursively build hierarchy node with descendants

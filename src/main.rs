@@ -247,7 +247,7 @@ async fn main() {
             } else {
                 hierarchies
             };
-            let tool_output = corr.hierarchies_to_json(&hierarchies);
+            let tool_output = corr.hierarchies_to_ancestor_json(&hierarchies, purl);
             let tool_json = serde_json::to_value(&tool_output).unwrap();
 
             let _ = std::fs::write(
@@ -457,7 +457,7 @@ async fn main() {
                     log::info!("================================================");
 
                     // Generate JSON output for ancestors
-                    let json_output = corr.hierarchies_to_json(&hierarchies);
+                    let json_output = corr.hierarchies_to_ancestor_json(&hierarchies, purl);
                     let output_file = "ancestor_hierarchy_output.json";
                     match serde_json::to_string_pretty(&json_output) {
                         Ok(json_string) => {

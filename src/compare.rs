@@ -62,9 +62,15 @@ pub struct ComparisonResult {
 }
 
 fn normalize_node_id(node_id: &str) -> String {
-    urlencoding::decode(node_id)
+    let decoded = urlencoding::decode(node_id)
         .unwrap_or(std::borrow::Cow::Borrowed(node_id))
-        .into_owned()
+        .into_owned();
+    if decoded.starts_with("pkg:") {
+        if let Some(q) = decoded.find('?') {
+            return decoded[..q].to_string();
+        }
+    }
+    decoded
 }
 
 fn normalize_purl(purl: &str) -> String {
@@ -124,6 +130,7 @@ fn flatten_node(
     let normalized_id = normalize_node_id(node_id);
 
     let descendants = value["descendants"].as_array();
+    let ancestors = value["ancestors"].as_array();
 
     let mut child_ids = Vec::new();
     if let Some(descs) = descendants {
@@ -131,6 +138,14 @@ fn flatten_node(
             let child_node_id = d["node_id"].as_str().unwrap_or_default();
             if !child_node_id.is_empty() {
                 child_ids.push(normalize_node_id(child_node_id));
+            }
+        }
+    }
+    if let Some(ancs) = ancestors {
+        for a in ancs {
+            let anc_node_id = a["node_id"].as_str().unwrap_or_default();
+            if !anc_node_id.is_empty() {
+                child_ids.push(normalize_node_id(anc_node_id));
             }
         }
     }
@@ -161,6 +176,11 @@ fn flatten_node(
     if let Some(descs) = descendants {
         for d in descs {
             flatten_node(d, depth + 1, Some(&normalized_id), result);
+        }
+    }
+    if let Some(ancs) = ancestors {
+        for a in ancs {
+            flatten_node(a, depth + 1, Some(&normalized_id), result);
         }
     }
 }

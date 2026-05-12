@@ -4,6 +4,8 @@ use reqwest::Response;
 use serde_derive::{Deserialize, Serialize};
 use urlencoding::encode;
 
+const MAX_TRAVERSAL_DEPTH: u64 = u64::MAX;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct APIToken {
     pub access_token: String,
@@ -169,9 +171,10 @@ pub async fn fetch_analysis_by_cpe(
 ) -> Result<AnalysisResponse, Box<dyn std::error::Error>> {
     let (client, token) = build_authenticated_client(config).await?;
     let url = format!(
-        "{}/api/v2/analysis/component/{}?descendants=10&limit=0",
+        "{}/api/v2/analysis/component/{}?descendants={}&limit=0",
         config.tpa_api_url,
-        encode(cpe)
+        encode(cpe),
+        MAX_TRAVERSAL_DEPTH
     );
     log::info!("Fetching analysis by CPE: {}", url);
 
@@ -197,9 +200,10 @@ pub async fn fetch_analysis_by_purl(
 ) -> Result<AnalysisResponse, Box<dyn std::error::Error>> {
     let (client, token) = build_authenticated_client(config).await?;
     let url = format!(
-        "{}/api/v2/analysis/component/{}?ancestors=10&limit=0",
+        "{}/api/v2/analysis/component/{}?ancestors={}&limit=0",
         config.tpa_api_url,
-        encode(purl)
+        encode(purl),
+        MAX_TRAVERSAL_DEPTH
     );
     log::info!("Fetching analysis by PURL: {}", url);
 
@@ -225,9 +229,10 @@ pub async fn fetch_latest_analysis_by_cpe(
 ) -> Result<AnalysisResponse, Box<dyn std::error::Error>> {
     let (client, token) = build_authenticated_client(config).await?;
     let url = format!(
-        "{}/api/v2/analysis/latest/component/{}?descendants=10&limit=0",
+        "{}/api/v2/analysis/latest/component/{}?descendants={}&limit=0",
         config.tpa_api_url,
-        encode(cpe)
+        encode(cpe),
+        MAX_TRAVERSAL_DEPTH
     );
     log::info!("Fetching latest analysis by CPE: {}", url);
 
@@ -253,9 +258,10 @@ pub async fn fetch_latest_analysis_by_purl(
 ) -> Result<AnalysisResponse, Box<dyn std::error::Error>> {
     let (client, token) = build_authenticated_client(config).await?;
     let url = format!(
-        "{}/api/v2/analysis/latest/component/{}?ancestors=10&limit=0",
+        "{}/api/v2/analysis/latest/component/{}?ancestors={}&limit=0",
         config.tpa_api_url,
-        encode(purl)
+        encode(purl),
+        MAX_TRAVERSAL_DEPTH
     );
     log::info!("Fetching latest analysis by PURL: {}", url);
 
