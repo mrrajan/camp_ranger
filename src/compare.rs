@@ -4,7 +4,6 @@ use std::error::Error;
 
 #[derive(Debug, Clone)]
 pub struct NormalizedNode {
-    pub original_node_id: String,
     pub normalized_node_id: String,
     pub name: String,
     pub version: String,
@@ -37,8 +36,8 @@ pub struct StructuralMismatch {
 }
 
 #[derive(Debug, Serialize)]
-pub struct MissingNodeRecord {
-    pub node_id: String,
+pub struct MissingInToolRecord {
+    pub api_node_id: String,
     pub name: String,
     pub version: String,
     pub purl: String,
@@ -49,6 +48,27 @@ pub struct MissingNodeRecord {
     pub sbom_id: String,
     pub document_id: String,
     pub has_warnings: String,
+    pub warnings: String,
+    pub node_id_mismatch: String,
+    pub tool_node_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MissingInApiRecord {
+    pub tool_node_id: String,
+    pub name: String,
+    pub version: String,
+    pub purl: String,
+    pub cpe: String,
+    pub published: String,
+    pub relationship: String,
+    pub depth_level: usize,
+    pub sbom_id: String,
+    pub document_id: String,
+    pub has_warnings: String,
+    pub warnings: String,
+    pub node_id_mismatch: String,
+    pub api_node_id: String,
 }
 
 pub struct ComparisonResult {
@@ -59,6 +79,8 @@ pub struct ComparisonResult {
     pub missing_in_api: Vec<NormalizedNode>,
     pub field_mismatches: Vec<FieldMismatch>,
     pub structural_mismatches: Vec<StructuralMismatch>,
+    pub node_id_mismatch_tool: HashMap<String, String>,
+    pub node_id_mismatch_api: HashMap<String, String>,
 }
 
 fn normalize_node_id(node_id: &str) -> String {
@@ -71,6 +93,21 @@ fn normalize_node_id(node_id: &str) -> String {
         }
     }
     decoded
+}
+
+fn extract_sha256(s: &str) -> Option<&str> {
+    let decoded_check = s;
+    if let Some(pos) = decoded_check.find("sha256:") {
+        let hash_start = pos + 7;
+        let hash = &decoded_check[hash_start..];
+        let end = hash
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(hash.len());
+        if end >= 64 {
+            return Some(&decoded_check[hash_start..hash_start + 64]);
+        }
+    }
+    None
 }
 
 fn normalize_purl(purl: &str) -> String {
@@ -155,7 +192,6 @@ fn flatten_node(
     }
 
     let node = NormalizedNode {
-        original_node_id: node_id.to_string(),
         normalized_node_id: normalized_id.clone(),
         name: value["name"].as_str().unwrap_or_default().to_string(),
         version: value["version"].as_str().unwrap_or_default().to_string(),
@@ -185,10 +221,7 @@ fn flatten_node(
     }
 }
 
-fn compare_fields(
-    api_node: &NormalizedNode,
-    tool_node: &NormalizedNode,
-) -> Vec<FieldMismatch> {
+fn compare_fields(api_node: &NormalizedNode, tool_node: &NormalizedNode) -> Vec<FieldMismatch> {
     let mut mismatches = Vec::new();
     let nid = &api_node.normalized_node_id;
 
@@ -346,6 +379,146 @@ pub fn compare_hierarchies(
         .collect();
     missing_in_api.sort_by(|a, b| a.depth.cmp(&b.depth).then(a.name.cmp(&b.name)));
 
+    // Detect node_id mismatches: unmatched API nodes that have a corresponding tool node
+    // with the same SHA256 digest but a different node_id.
+    // First checks missing_in_api (same depth), then falls back to all tool nodes (any depth)
+    // to catch cases where flatten deduplication dropped the tool's counterpart.
+    let mut node_id_mismatch_map: HashMap<String, String> = HashMap::new();
+    for api_node in &missing_in_tool {
+        let api_hash = extract_sha256(&api_node.normalized_node_id)
+            .or_else(|| api_node.purl.iter().find_map(|p| extract_sha256(p)));
+        if let Some(api_hash) = api_hash {
+            // First: try matching against missing_in_api at the same depth
+            let found = missing_in_api.iter().find(|tool_node| {
+                tool_node.depth == api_node.depth && {
+                    let tool_hash = extract_sha256(&tool_node.normalized_node_id)
+                        .or_else(|| tool_node.purl.iter().find_map(|p| extract_sha256(p)));
+                    tool_hash == Some(api_hash)
+                }
+            });
+            if let Some(tool_node) = found {
+                node_id_mismatch_map.insert(
+                    api_node.normalized_node_id.clone(),
+                    tool_node.normalized_node_id.clone(),
+                );
+                continue;
+            }
+            // Fallback: search all tool nodes for a SHA256 match at any depth.
+            // Handles cases where the tool's counterpart was deduplicated by flatten
+            // (e.g. same component name at depth 2 and 4, depth 4 overwrites depth 2).
+            let found_any = tool_nodes.values().find(|tool_node| {
+                tool_node.normalized_node_id != api_node.normalized_node_id && {
+                    let tool_hash = extract_sha256(&tool_node.normalized_node_id)
+                        .or_else(|| tool_node.purl.iter().find_map(|p| extract_sha256(p)));
+                    tool_hash == Some(api_hash)
+                }
+            });
+            if let Some(tool_node) = found_any {
+                node_id_mismatch_map.insert(
+                    api_node.normalized_node_id.clone(),
+                    tool_node.normalized_node_id.clone(),
+                );
+            }
+        }
+    }
+    if !node_id_mismatch_map.is_empty() {
+        log::info!(
+            "Detected {} node_id mismatches in missing_in_tool (same SHA256, different node_id)",
+            node_id_mismatch_map.len()
+        );
+    }
+
+    // Reverse direction: detect tool nodes in missing_in_api that have an API counterpart.
+    // First, SHA256 scan (same as above but reversed).
+    let mut node_id_mismatch_api: HashMap<String, String> = HashMap::new();
+    for tool_node in &missing_in_api {
+        let tool_hash = extract_sha256(&tool_node.normalized_node_id)
+            .or_else(|| tool_node.purl.iter().find_map(|p| extract_sha256(p)));
+        if let Some(tool_hash) = tool_hash {
+            let found = missing_in_tool.iter().find(|api_node| {
+                api_node.depth == tool_node.depth && {
+                    let api_hash = extract_sha256(&api_node.normalized_node_id)
+                        .or_else(|| api_node.purl.iter().find_map(|p| extract_sha256(p)));
+                    api_hash == Some(tool_hash)
+                }
+            });
+            if let Some(api_node) = found {
+                node_id_mismatch_api.insert(
+                    tool_node.normalized_node_id.clone(),
+                    api_node.normalized_node_id.clone(),
+                );
+                continue;
+            }
+            let found_any = api_nodes.values().find(|api_node| {
+                api_node.normalized_node_id != tool_node.normalized_node_id && {
+                    let api_hash = extract_sha256(&api_node.normalized_node_id)
+                        .or_else(|| api_node.purl.iter().find_map(|p| extract_sha256(p)));
+                    api_hash == Some(tool_hash)
+                }
+            });
+            if let Some(api_node) = found_any {
+                node_id_mismatch_api.insert(
+                    tool_node.normalized_node_id.clone(),
+                    api_node.normalized_node_id.clone(),
+                );
+            }
+        }
+    }
+    // Second pass: reverse the forward map to catch cases lost to flatten deduplication.
+    // If missing_in_tool already says "API node X <-> tool node Y", then tool node Y
+    // in missing_in_api should also be flagged pointing back to API node X.
+    let missing_in_api_ids: HashSet<_> = missing_in_api
+        .iter()
+        .map(|n| n.normalized_node_id.clone())
+        .collect();
+    for (api_id, tool_id) in &node_id_mismatch_map {
+        if missing_in_api_ids.contains(tool_id) && !node_id_mismatch_api.contains_key(tool_id) {
+            node_id_mismatch_api.insert(tool_id.clone(), api_id.clone());
+        }
+    }
+    // Third pass: for still-unmatched tool nodes, check if the forward map has an entry
+    // for the SAME API node_id but pointing to a DIFFERENT tool node (same component,
+    // different release). This handles flatten dedup where the API has duplicate node_ids
+    // across releases — only one purl survives, so the forward map only captures one pair,
+    // but the other release's tool node shares the same name and depth.
+    // When the API node_id contains an arch suffix (e.g. _amd64, _arm64), prefer matching
+    // against a tool node whose purl contains the same arch.
+    for tool_node in &missing_in_api {
+        if node_id_mismatch_api.contains_key(&tool_node.normalized_node_id) {
+            continue;
+        }
+        let tool_purl_joined = tool_node.purl.join(" ");
+        let mut best_match: Option<&str> = None;
+        for (api_id, _) in &node_id_mismatch_map {
+            if let Some(api_node) = api_nodes.get(api_id) {
+                if api_node.depth == tool_node.depth
+                    && api_node.name == tool_node.name
+                    && api_node.relationship == tool_node.relationship
+                {
+                    if best_match.is_none() {
+                        best_match = Some(api_id);
+                    }
+                    let arch_match = (api_id.contains("amd64")
+                        && tool_purl_joined.contains("amd64"))
+                        || (api_id.contains("arm64") && tool_purl_joined.contains("arm64"));
+                    if arch_match {
+                        best_match = Some(api_id);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(api_id) = best_match {
+            node_id_mismatch_api.insert(tool_node.normalized_node_id.clone(), api_id.to_string());
+        }
+    }
+    if !node_id_mismatch_api.is_empty() {
+        log::info!(
+            "Detected {} node_id mismatches in missing_in_api (same SHA256, different node_id)",
+            node_id_mismatch_api.len()
+        );
+    }
+
     let mut field_mismatches = Vec::new();
     let mut structural_mismatches = Vec::new();
     for id in &matched_ids {
@@ -363,6 +536,8 @@ pub fn compare_hierarchies(
         missing_in_api,
         field_mismatches,
         structural_mismatches,
+        node_id_mismatch_tool: node_id_mismatch_map,
+        node_id_mismatch_api,
     })
 }
 
@@ -381,7 +556,10 @@ pub fn write_markdown_report(
     // Summary table
     report.push_str("## Summary\n\n");
     report.push_str("| Metric | Count |\n|--------|-------|\n");
-    report.push_str(&format!("| API total nodes | {} |\n", result.api_node_count));
+    report.push_str(&format!(
+        "| API total nodes | {} |\n",
+        result.api_node_count
+    ));
     report.push_str(&format!(
         "| Tool total nodes | {} |\n",
         result.tool_node_count
@@ -415,7 +593,10 @@ pub fn write_markdown_report(
         let mut by_depth: HashMap<usize, usize> = HashMap::new();
         let mut with_warnings = 0;
         for node in &result.missing_in_tool {
-            let rel = node.relationship.clone().unwrap_or_else(|| "(root)".to_string());
+            let rel = node
+                .relationship
+                .clone()
+                .unwrap_or_else(|| "(root)".to_string());
             *by_relationship.entry(rel).or_insert(0) += 1;
             *by_depth.entry(node.depth).or_insert(0) += 1;
             if !node.warnings.is_empty() {
@@ -440,7 +621,11 @@ pub fn write_markdown_report(
         }
 
         report.push_str(&format!(
-            "\nNodes with warnings (unresolved references): **{}**\n",
+            "\nNodes with warnings from TPA API (e.g. unable to resolve external references): **{}**\n\
+             \nNote: The `has_warnings` and `warnings` fields in `missing_in_tool.csv` are sourced \
+             directly from the TPA API's analysis response. They indicate issues the API encountered \
+             while building its own graph (e.g. `\"Unable to resolve external node: ...\"`). These are \
+             not generated by Camp Ranger.\n",
             with_warnings
         ));
 
@@ -560,11 +745,19 @@ pub fn write_markdown_report(
     Ok(())
 }
 
-fn write_missing_csv(path: &str, nodes: &[NormalizedNode]) -> Result<(), Box<dyn Error>> {
+fn write_missing_in_tool_csv(
+    path: &str,
+    nodes: &[NormalizedNode],
+    mismatch_map: &HashMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
     let mut wtr = csv::Writer::from_path(path)?;
     for node in nodes {
-        wtr.serialize(MissingNodeRecord {
-            node_id: node.normalized_node_id.clone(),
+        let (mismatch_flag, tool_id) = match mismatch_map.get(&node.normalized_node_id) {
+            Some(id) => ("yes".to_string(), id.clone()),
+            None => ("no".to_string(), String::new()),
+        };
+        wtr.serialize(MissingInToolRecord {
+            api_node_id: node.normalized_node_id.clone(),
             name: node.name.clone(),
             version: node.version.clone(),
             purl: node.purl.join("; "),
@@ -579,6 +772,46 @@ fn write_missing_csv(path: &str, nodes: &[NormalizedNode]) -> Result<(), Box<dyn
             } else {
                 format!("yes ({})", node.warnings.len())
             },
+            warnings: node.warnings.join("; "),
+            node_id_mismatch: mismatch_flag,
+            tool_node_id: tool_id,
+        })?;
+    }
+    wtr.flush()?;
+    log::info!("Written {} ({} records)", path, nodes.len());
+    Ok(())
+}
+
+fn write_missing_in_api_csv(
+    path: &str,
+    nodes: &[NormalizedNode],
+    mismatch_map: &HashMap<String, String>,
+) -> Result<(), Box<dyn Error>> {
+    let mut wtr = csv::Writer::from_path(path)?;
+    for node in nodes {
+        let (mismatch_flag, api_id) = match mismatch_map.get(&node.normalized_node_id) {
+            Some(id) => ("yes".to_string(), id.clone()),
+            None => ("no".to_string(), String::new()),
+        };
+        wtr.serialize(MissingInApiRecord {
+            tool_node_id: node.normalized_node_id.clone(),
+            name: node.name.clone(),
+            version: node.version.clone(),
+            purl: node.purl.join("; "),
+            cpe: node.cpe.join("; "),
+            published: node.published.clone(),
+            relationship: node.relationship.clone().unwrap_or_default(),
+            depth_level: node.depth,
+            sbom_id: node.sbom_id.clone().unwrap_or_default(),
+            document_id: node.document_id.clone().unwrap_or_default(),
+            has_warnings: if node.warnings.is_empty() {
+                "no".to_string()
+            } else {
+                format!("yes ({})", node.warnings.len())
+            },
+            warnings: node.warnings.join("; "),
+            node_id_mismatch: mismatch_flag,
+            api_node_id: api_id,
         })?;
     }
     wtr.flush()?;
@@ -587,8 +820,16 @@ fn write_missing_csv(path: &str, nodes: &[NormalizedNode]) -> Result<(), Box<dyn
 }
 
 pub fn write_csv_outputs(result: &ComparisonResult) -> Result<(), Box<dyn Error>> {
-    write_missing_csv("missing_in_tool.csv", &result.missing_in_tool)?;
-    write_missing_csv("missing_in_api.csv", &result.missing_in_api)?;
+    write_missing_in_tool_csv(
+        "missing_in_tool.csv",
+        &result.missing_in_tool,
+        &result.node_id_mismatch_tool,
+    )?;
+    write_missing_in_api_csv(
+        "missing_in_api.csv",
+        &result.missing_in_api,
+        &result.node_id_mismatch_api,
+    )?;
 
     if !result.field_mismatches.is_empty() {
         let mut wtr = csv::Writer::from_path("field_mismatches.csv")?;
@@ -639,10 +880,7 @@ pub fn print_summary(result: &ComparisonResult) {
     println!();
 }
 
-pub fn compare_and_export(
-    atlas_file: &str,
-    tool_file: &str,
-) -> Result<(), Box<dyn Error>> {
+pub fn compare_and_export(atlas_file: &str, tool_file: &str) -> Result<(), Box<dyn Error>> {
     log::info!("Loading API/Atlas response from: {}", atlas_file);
     let atlas_content = std::fs::read_to_string(atlas_file)?;
     let atlas_json: serde_json::Value = serde_json::from_str(&atlas_content)?;

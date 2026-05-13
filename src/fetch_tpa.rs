@@ -104,16 +104,6 @@ fn attach_auth(
     }
 }
 
-pub async fn get_token(config: &TpaConfig) -> Result<String, Box<dyn std::error::Error>> {
-    let (_, token) = build_authenticated_client(config).await?;
-    token.ok_or_else(|| {
-        Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "No auth credentials provided",
-        )) as Box<dyn std::error::Error>
-    })
-}
-
 pub async fn fetch_tpa_sbom(config: TpaConfig) -> Result<TpaSbomList, Box<dyn std::error::Error>> {
     let (client, token) = build_authenticated_client(&config).await?;
     log::info!("Token/auth ready");
@@ -184,7 +174,11 @@ pub async fn fetch_analysis_by_cpe(
     if response.status().is_success() {
         let text = response.text().await?;
         let analysis: AnalysisResponse = serde_json::from_str(&text)?;
-        log::info!("Analysis returned {} items (total: {})", analysis.items.len(), analysis.total);
+        log::info!(
+            "Analysis returned {} items (total: {})",
+            analysis.items.len(),
+            analysis.total
+        );
         Ok(analysis)
     } else {
         Err(Box::new(std::io::Error::new(
@@ -213,7 +207,11 @@ pub async fn fetch_analysis_by_purl(
     if response.status().is_success() {
         let text = response.text().await?;
         let analysis: AnalysisResponse = serde_json::from_str(&text)?;
-        log::info!("Analysis returned {} items (total: {})", analysis.items.len(), analysis.total);
+        log::info!(
+            "Analysis returned {} items (total: {})",
+            analysis.items.len(),
+            analysis.total
+        );
         Ok(analysis)
     } else {
         Err(Box::new(std::io::Error::new(
@@ -242,7 +240,11 @@ pub async fn fetch_latest_analysis_by_cpe(
     if response.status().is_success() {
         let text = response.text().await?;
         let analysis: AnalysisResponse = serde_json::from_str(&text)?;
-        log::info!("Latest analysis returned {} items (total: {})", analysis.items.len(), analysis.total);
+        log::info!(
+            "Latest analysis returned {} items (total: {})",
+            analysis.items.len(),
+            analysis.total
+        );
         Ok(analysis)
     } else {
         Err(Box::new(std::io::Error::new(
@@ -271,7 +273,11 @@ pub async fn fetch_latest_analysis_by_purl(
     if response.status().is_success() {
         let text = response.text().await?;
         let analysis: AnalysisResponse = serde_json::from_str(&text)?;
-        log::info!("Latest analysis returned {} items (total: {})", analysis.items.len(), analysis.total);
+        log::info!(
+            "Latest analysis returned {} items (total: {})",
+            analysis.items.len(),
+            analysis.total
+        );
         Ok(analysis)
     } else {
         Err(Box::new(std::io::Error::new(

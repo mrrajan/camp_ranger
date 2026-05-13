@@ -71,16 +71,19 @@ fn extract_name_version_from_purl(purl: &str) -> (String, String) {
 
         // Split version from qualifiers+subpath
         let (version_raw, qualifiers_str) = if let Some(query_pos) = version_and_rest.find('?') {
-            (&version_and_rest[..query_pos], Some(&version_and_rest[query_pos + 1..]))
+            (
+                &version_and_rest[..query_pos],
+                Some(&version_and_rest[query_pos + 1..]),
+            )
         } else {
             (version_and_rest, None)
         };
 
         // Extract #subpath (can appear after version or after qualifiers)
-        let subpath = version_raw.find('#').map(|pos| &version_raw[pos + 1..])
-            .or_else(|| {
-                qualifiers_str.and_then(|qs| qs.find('#').map(|pos| &qs[pos + 1..]))
-            });
+        let subpath = version_raw
+            .find('#')
+            .map(|pos| &version_raw[pos + 1..])
+            .or_else(|| qualifiers_str.and_then(|qs| qs.find('#').map(|pos| &qs[pos + 1..])));
 
         // Strip #subpath from version
         let version_raw = if let Some(hash_pos) = version_raw.find('#') {
@@ -96,15 +99,18 @@ fn extract_name_version_from_purl(purl: &str) -> (String, String) {
 
         // Check for epoch qualifier and prepend to version
         let epoch = qualifiers_str.and_then(|qs| {
-            let qs = if let Some(hash_pos) = qs.find('#') { &qs[..hash_pos] } else { qs };
-            qs.split('&')
-                .find_map(|pair| {
-                    let mut kv = pair.splitn(2, '=');
-                    match (kv.next(), kv.next()) {
-                        (Some("epoch"), Some(v)) => Some(v.to_string()),
-                        _ => None,
-                    }
-                })
+            let qs = if let Some(hash_pos) = qs.find('#') {
+                &qs[..hash_pos]
+            } else {
+                qs
+            };
+            qs.split('&').find_map(|pair| {
+                let mut kv = pair.splitn(2, '=');
+                match (kv.next(), kv.next()) {
+                    (Some("epoch"), Some(v)) => Some(v.to_string()),
+                    _ => None,
+                }
+            })
         });
 
         let version = match epoch {
@@ -155,11 +161,19 @@ fn extract_name_version_from_purl(purl: &str) -> (String, String) {
             purl_clean
         };
         let is_golang = purl_without_subpath.starts_with("pkg:golang/");
-        let subpath = purl_clean.find('#').map(|pos| &purl_clean[pos + 1..])
-            .or_else(|| purl.find('#').map(|pos| {
-                let rest = &purl[pos + 1..];
-                if let Some(q) = rest.find('?') { &rest[..q] } else { rest }
-            }));
+        let subpath = purl_clean
+            .find('#')
+            .map(|pos| &purl_clean[pos + 1..])
+            .or_else(|| {
+                purl.find('#').map(|pos| {
+                    let rest = &purl[pos + 1..];
+                    if let Some(q) = rest.find('?') {
+                        &rest[..q]
+                    } else {
+                        rest
+                    }
+                })
+            });
 
         let name = if is_golang {
             let base = if let Some(slash_pos) = purl_without_subpath.find('/') {
@@ -258,9 +272,12 @@ impl HierarchyNode {
             .or_else(|| {
                 // Try to find self-referencing component by matching purl
                 if let Some(meta_purl) = metadata_component.and_then(|c| c.purl.as_ref()) {
-                    sbom.components.iter()
+                    sbom.components
+                        .iter()
                         .find(|comp| {
-                            comp.purl.as_ref().map_or(false, |p| purls_match_by_sha256(p, meta_purl))
+                            comp.purl
+                                .as_ref()
+                                .map_or(false, |p| purls_match_by_sha256(p, meta_purl))
                         })
                         .and_then(|comp| comp.version.clone())
                 } else {
@@ -290,7 +307,10 @@ impl HierarchyNode {
         node_id: String,
     ) -> Self {
         let purl = component.purl.clone().map(|p| vec![p]).unwrap_or_default();
-        let name = component.name.clone().unwrap_or_else(|| "Unknown".to_string());
+        let name = component
+            .name
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string());
         let version = component.version.clone().unwrap_or_default();
 
         Self {
@@ -449,7 +469,8 @@ impl SbomCorrelation {
                     if let Some(variants) = &pedigree.variants {
                         for variant in variants {
                             if let Some(variant_purl) = &variant.purl {
-                                if purls_match_by_sha256(purl, variant_purl) || purl == variant_purl {
+                                if purls_match_by_sha256(purl, variant_purl) || purl == variant_purl
+                                {
                                     filtered_nodes.push(node.clone());
                                     break;
                                 }
@@ -488,35 +509,6 @@ impl SbomCorrelation {
             hierarchies.len(),
             total_sboms,
             cpe
-        );
-        hierarchies
-    }
-
-    /// Get the complete SBOM hierarchy starting from PURL-matching SBOMs (descendants)
-    /// Returns a Vec of hierarchies, where each hierarchy is a Vec of SBOMs starting from one PURL-matching node
-    pub fn get_sbom_hierarchy_by_purl(&self, purl: &str) -> Vec<Vec<SbomWithRank>> {
-        let initial_nodes = self.get_sbom_node_by_purl(purl);
-
-        if initial_nodes.is_empty() {
-            log::warn!("No SBOMs found matching PURL: {}", purl);
-            return Vec::new();
-        }
-
-        let mut hierarchies = Vec::new();
-
-        for node in initial_nodes {
-            let mut hierarchy = Vec::new();
-            let mut visited = HashSet::new();
-            self.collect_references_recursive(&node, &mut hierarchy, &mut visited);
-            hierarchies.push(hierarchy);
-        }
-
-        let total_sboms: usize = hierarchies.iter().map(|h| h.len()).sum();
-        log::info!(
-            "Collected {} hierarchies with {} total SBOMs for PURL: {}",
-            hierarchies.len(),
-            total_sboms,
-            purl
         );
         hierarchies
     }
@@ -653,12 +645,7 @@ impl SbomCorrelation {
                     .and_then(|c| c.name.clone())
                     .unwrap_or_else(|| root.sbom.serial_number.clone());
 
-                let timestamp = root
-                    .sbom
-                    .metadata
-                    .timestamp
-                    .clone()
-                    .unwrap_or_default();
+                let timestamp = root.sbom.metadata.timestamp.clone().unwrap_or_default();
 
                 by_name
                     .entry(name)
@@ -671,19 +658,12 @@ impl SbomCorrelation {
         for (name, mut entries) in by_name {
             entries.sort_by(|a, b| b.0.cmp(&a.0));
             if let Some((ts, hierarchy)) = entries.into_iter().next() {
-                log::info!(
-                    "Latest hierarchy for '{}': timestamp={}",
-                    name,
-                    ts
-                );
+                log::info!("Latest hierarchy for '{}': timestamp={}", name, ts);
                 result.push(hierarchy);
             }
         }
 
-        log::info!(
-            "Filtered to {} latest hierarchy/hierarchies",
-            result.len()
-        );
+        log::info!("Filtered to {} latest hierarchy/hierarchies", result.len());
         result
     }
 
@@ -693,7 +673,8 @@ impl SbomCorrelation {
 
         for hierarchy in hierarchies {
             if let Some(root_node) = hierarchy.first() {
-                let json_node = self.build_hierarchy_node(root_node, hierarchy, &mut HashSet::new());
+                let json_node =
+                    self.build_hierarchy_node(root_node, hierarchy, &mut HashSet::new());
                 items.push(json_node);
             }
         }
@@ -704,7 +685,11 @@ impl SbomCorrelation {
     /// Convert hierarchies to JSON output format for ancestor chains.
     /// Produces nested `ancestors` arrays matching the API's ancestor response shape.
     /// `target_purl` is the queried PURL placed as the outermost node.
-    pub fn hierarchies_to_ancestor_json(&self, hierarchies: &[Vec<SbomWithRank>], target_purl: &str) -> HierarchyJsonOutput {
+    pub fn hierarchies_to_ancestor_json(
+        &self,
+        hierarchies: &[Vec<SbomWithRank>],
+        target_purl: &str,
+    ) -> HierarchyJsonOutput {
         let mut items = Vec::new();
 
         for hierarchy in hierarchies {
@@ -773,7 +758,9 @@ impl SbomCorrelation {
             cpe: Vec::new(),
             name,
             version,
-            published: hierarchy.first().and_then(|h| h.sbom.metadata.timestamp.clone()),
+            published: hierarchy
+                .first()
+                .and_then(|h| h.sbom.metadata.timestamp.clone()),
             relationship: None,
             descendants: Vec::new(),
             ancestors: vec![sbom_chain],
@@ -810,7 +797,8 @@ impl SbomCorrelation {
         let mut hierarchy_node = HierarchyNode::from_sbom(&node.sbom, node_name.clone());
 
         // Get this SBOM's own purl for self-reference checking
-        let own_purl = node.sbom
+        let own_purl = node
+            .sbom
             .metadata
             .component
             .as_ref()
@@ -841,19 +829,33 @@ impl SbomCorrelation {
                             continue;
                         }
 
-                        if let Some(child_node) = hierarchy.iter().find(|n| &n.sbom.serial_number == child_serial) {
-                            if let Some(child_purl) = &child_node.sbom.metadata.component.as_ref().and_then(|c| c.purl.clone()) {
+                        if let Some(child_node) = hierarchy
+                            .iter()
+                            .find(|n| &n.sbom.serial_number == child_serial)
+                        {
+                            if let Some(child_purl) = &child_node
+                                .sbom
+                                .metadata
+                                .component
+                                .as_ref()
+                                .and_then(|c| c.purl.clone())
+                            {
                                 if purls_match_by_sha256(component_purl, child_purl) {
                                     log::debug!(
                                         "  Adding descendant (component): '{}' -> '{}'",
                                         node_name,
-                                        child_node.sbom.metadata.component.as_ref()
+                                        child_node
+                                            .sbom
+                                            .metadata
+                                            .component
+                                            .as_ref()
                                             .and_then(|c| c.name.as_ref())
                                             .unwrap_or(&"Unknown".to_string())
                                     );
 
                                     // Add the child SBOM as descendant of this component
-                                    let mut child_json = self.build_hierarchy_node(child_node, hierarchy, visited);
+                                    let mut child_json =
+                                        self.build_hierarchy_node(child_node, hierarchy, visited);
                                     child_json.relationship = Some("package".to_string());
                                     component_node.descendants.push(child_json);
                                     break;
@@ -881,6 +883,7 @@ impl SbomCorrelation {
                                 variant_purl.clone(),
                             );
                             component_node.purl = vec![variant_purl.clone()];
+                            component_node.relationship = Some("variant".to_string());
 
                             // Check if this variant references a child SBOM
                             for child_serial in &node.references {
@@ -888,19 +891,34 @@ impl SbomCorrelation {
                                     continue;
                                 }
 
-                                if let Some(child_node) = hierarchy.iter().find(|n| &n.sbom.serial_number == child_serial) {
-                                    if let Some(child_purl) = &child_node.sbom.metadata.component.as_ref().and_then(|c| c.purl.clone()) {
+                                if let Some(child_node) = hierarchy
+                                    .iter()
+                                    .find(|n| &n.sbom.serial_number == child_serial)
+                                {
+                                    if let Some(child_purl) = &child_node
+                                        .sbom
+                                        .metadata
+                                        .component
+                                        .as_ref()
+                                        .and_then(|c| c.purl.clone())
+                                    {
                                         if purls_match_by_sha256(variant_purl, child_purl) {
                                             log::debug!(
                                                 "  Adding descendant (variant): '{}' -> '{}'",
                                                 node_name,
-                                                child_node.sbom.metadata.component.as_ref()
+                                                child_node
+                                                    .sbom
+                                                    .metadata
+                                                    .component
+                                                    .as_ref()
                                                     .and_then(|c| c.name.as_ref())
                                                     .unwrap_or(&"Unknown".to_string())
                                             );
 
                                             // Add the child SBOM as descendant of this component
-                                            let mut child_json = self.build_hierarchy_node(child_node, hierarchy, visited);
+                                            let mut child_json = self.build_hierarchy_node(
+                                                child_node, hierarchy, visited,
+                                            );
                                             child_json.relationship = Some("package".to_string());
                                             component_node.descendants.push(child_json);
                                             break;
@@ -934,7 +952,8 @@ impl SbomCorrelation {
                 Some(deps)
             } else {
                 // Try matching by SHA256 for OCI packages
-                dependency_map.iter()
+                dependency_map
+                    .iter()
                     .find(|(ref_purl, _)| purls_match_by_sha256(own_purl, ref_purl))
                     .map(|(_, deps)| deps)
             };
@@ -948,10 +967,8 @@ impl SbomCorrelation {
 
                 // Add each dependency directly to the SBOM node
                 for dep_purl in dep_purls {
-                    let dep_node = HierarchyNode::from_dependency_purl(
-                        dep_purl.clone(),
-                        published.clone(),
-                    );
+                    let dep_node =
+                        HierarchyNode::from_dependency_purl(dep_purl.clone(), published.clone());
                     hierarchy_node.descendants.push(dep_node);
                 }
             }
@@ -966,7 +983,8 @@ impl SbomCorrelation {
                 Some(deps)
             } else {
                 // Try matching by SHA256 for OCI packages
-                dependency_map.iter()
+                dependency_map
+                    .iter()
                     .find(|(ref_purl, _)| purls_match_by_sha256(&component_node.node_id, ref_purl))
                     .map(|(_, deps)| deps)
             };
@@ -980,10 +998,8 @@ impl SbomCorrelation {
 
                 // Add each dependency as a child of this component
                 for dep_purl in dep_purls {
-                    let dep_node = HierarchyNode::from_dependency_purl(
-                        dep_purl.clone(),
-                        published.clone(),
-                    );
+                    let dep_node =
+                        HierarchyNode::from_dependency_purl(dep_purl.clone(), published.clone());
                     component_node.descendants.push(dep_node);
                 }
             }
@@ -1007,7 +1023,9 @@ impl SbomCorrelation {
 /// Returns (forward_graph, reverse_graph) where:
 /// - forward_graph: parent -> [children]
 /// - reverse_graph: child -> [parents]
-fn build_reference_graph(sboms: &HashMap<String, TpaSbom>) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
+fn build_reference_graph(
+    sboms: &HashMap<String, TpaSbom>,
+) -> (HashMap<String, Vec<String>>, HashMap<String, Vec<String>>) {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
     let mut referenced_by: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1251,18 +1269,16 @@ mod tests {
 
     #[test]
     fn test_extract_name_version_with_subpath() {
-        let (name, version) = extract_name_version_from_purl(
-            "pkg:golang/github.com/google/renameio@v2.0.0#v2",
-        );
+        let (name, version) =
+            extract_name_version_from_purl("pkg:golang/github.com/google/renameio@v2.0.0#v2");
         assert_eq!(name, "github.com/google/renameio/v2");
         assert_eq!(version, "v2.0.0");
     }
 
     #[test]
     fn test_extract_name_version_simple_rpm() {
-        let (name, version) = extract_name_version_from_purl(
-            "pkg:rpm/redhat/zlib@1.2.11-40.el9?arch=aarch64",
-        );
+        let (name, version) =
+            extract_name_version_from_purl("pkg:rpm/redhat/zlib@1.2.11-40.el9?arch=aarch64");
         assert_eq!(name, "zlib");
         assert_eq!(version, "1.2.11-40.el9");
     }
@@ -1272,7 +1288,10 @@ mod tests {
         let (name, version) = extract_name_version_from_purl(
             "pkg:golang/github.com/kubernetes-csi/external-snapshotter@v4.2.0#client/v4",
         );
-        assert_eq!(name, "github.com/kubernetes-csi/external-snapshotter/client/v4");
+        assert_eq!(
+            name,
+            "github.com/kubernetes-csi/external-snapshotter/client/v4"
+        );
         assert_eq!(version, "v4.2.0");
     }
 }
